@@ -1,4 +1,8 @@
-import { useState, useRef } from "react";
+import { useState, useEffect, useMemo } from "react";
+import { MediaRecorderAdapter } from "./adapters/MediaRecorderAdapter";
+import { AudioContextAdapter } from "./adapters/AudioContextAdapter";
+import { RecordingManager } from "./managers/RecordingManager";
+import { PlaybackManager, type PlaybackTrack } from "./managers/PlaybackManager";
 
 const BEATS_PER_BLOCK = 8;
 const TOTAL_BLOCKS = 4;
@@ -13,9 +17,38 @@ interface Track {
   blocks: AudioBlock[];
 }
 
+/**
+ * カスタムフック: UIからオーディオロジックを完全に分離するための接着剤
+ */
+function useCanonEngine() {
+  // 1. AdapterとManagerのインスタンスを生成し、維持する（再レンダリングで消えないようにする）
+  const adapters = useMemo(() => {
+    const audioCtx = new AudioContextAdapter();
+    const mediaRec = new MediaRecorderAdapter();
+    return { audioCtx, mediaRec };
+  }, []);
+
+  const managers = useMemo(() => {
+    return {
+      recorder: new RecordingManager(adapters.mediaRec, adapters.audioCtx),
+      playback: new PlaybackManager(adapters.audioCtx),
+    };
+  }, [adapters]);
+
+  // マウント時にクリック音を読み込んでおく
+  useEffect(() => {
+    managers.recorder.loadClickSound("/click.mp3");
+  }, [managers.recorder]);
+
+  return managers;
+}
+
 function App() {
+  // --- カスタムフックからManagerを呼び出す ---
+  const { recorder, playback } = useCanonEngine();
+
   // --- ステート管理 ---
-  const [bpm, setBpm] = useState(39); // ★ デフォルトを39に設定
+  const [bpm, setBpm] = useState(39);
   const [tracks, setTracks] = useState<Track[]>(() =>
     [0, 1, 2, 3].map((id) => ({
       id,
@@ -26,48 +59,29 @@ function App() {
 
   const [recordingTarget, setRecordingTarget] = useState<{ trackId: number; blockIndex: number } | null>(null);
   const [isCountingIn, setIsCountingIn] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false); // 再生中のUI制御用
 
-  // --- 計算値（BPMに依存） ---
+  // --- 計算値 ---
   const secondsPerBeat = 60 / bpm;
   const secondsPerBlock = BEATS_PER_BLOCK * secondsPerBeat;
 
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const autoStopTimerRef = useRef<number | null>(null);
+  /**
+   * 録音開始フロー（非同期のPromiseで超シンプルに！）
+   */
+  const handleStartRecording = async (trackId: number, blockIndex: number) => {
+    setRecordingTarget({ trackId, blockIndex });
+    setIsCountingIn(true);
 
-  const loadClickSound = async (ctx: AudioContext) => {
-    const response = await fetch("/click.mp3");
-    const arrayBuffer = await response.arrayBuffer();
-    return await ctx.decodeAudioData(arrayBuffer);
-  };
+    // カウントイン（4拍）が終わるタイミングでUIの「Wait...」を消すためのタイマー
+    const countInMs = secondsPerBeat * 4 * 1000;
+    const uiTimer = setTimeout(() => setIsCountingIn(false), countInMs);
 
-  const startRecording = async (trackId: number, blockIndex: number) => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      if (!audioContextRef.current) audioContextRef.current = new AudioContext();
-      const ctx = audioContextRef.current;
-      if (ctx.state === "suspended") await ctx.resume();
+      // Managerにすべてを丸投げし、Blobが返ってくるまでここで待機！
+      const blob = await recorder.startRecording(bpm);
 
-      const clickBuffer = await loadClickSound(ctx);
-
-      setIsCountingIn(true);
-      const now = ctx.currentTime;
-      // カウントイン（BPMに基づいたタイミング）
-      for (let i = 0; i < 4; i++) {
-        const source = ctx.createBufferSource();
-        source.buffer = clickBuffer;
-        source.connect(ctx.destination);
-        source.start(now + i * secondsPerBeat);
-      }
-
-      const mediaRecorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = mediaRecorder;
-      audioChunksRef.current = [];
-
-      mediaRecorder.ondataavailable = (e) => audioChunksRef.current.push(e.data);
-      mediaRecorder.onstop = () => {
-        const blob = new Blob(audioChunksRef.current, { type: "audio/webm" });
+      if (blob) {
+        // キャンセルされず、正常にBlobが返ってきたらStateを更新
         setTracks((prev) =>
           prev.map((t) => {
             if (t.id !== trackId) return t;
@@ -76,68 +90,79 @@ function App() {
             return { ...t, blocks: newBlocks };
           }),
         );
-        stream.getTracks().forEach((track) => track.stop());
-      };
-
-      setTimeout(
-        () => {
-          mediaRecorder.start();
-          setRecordingTarget({ trackId, blockIndex });
-          setIsCountingIn(false);
-
-          // 現在のBPMに基づいた時間で自動停止
-          autoStopTimerRef.current = window.setTimeout(() => stopRecording(), secondsPerBlock * 1000);
-        },
-        4 * secondsPerBeat * 1000,
-      );
+      }
     } catch (error) {
-      console.error(error);
+      console.error("録音エラー:", error);
+    } finally {
+      // 成功・キャンセル・エラー問わず、UIを初期状態に戻す
+      clearTimeout(uiTimer);
+      setRecordingTarget(null);
       setIsCountingIn(false);
     }
   };
 
-  const stopRecording = () => {
-    mediaRecorderRef.current?.stop();
-    setRecordingTarget(null);
-    if (autoStopTimerRef.current) {
-      clearTimeout(autoStopTimerRef.current);
-      autoStopTimerRef.current = null;
+  /**
+   * 録音停止
+   */
+  const handleStopRecording = () => {
+    // isCancel = false （そこまでのデータを保存して返す）として呼び出す
+    recorder.stopRecording(false);
+  };
+
+  /**
+   * 再生フロー（配列を作って投げるだけ！）
+   */
+  const handlePlayAll = async (isCanon: boolean = false) => {
+    if (isPlaying) {
+      playback.stop();
+      setIsPlaying(false);
+      return;
+    }
+
+    // 1. ReactのState (tracks) から、PlaybackManagerが求める発注書 (PlaybackTrack[]) を作成
+    const playbackTracks: PlaybackTrack[] = [];
+
+    tracks.forEach((track) => {
+      track.blocks.forEach((block, index) => {
+        if (!block.blob) return;
+
+        // ブロックの位置による遅延（8拍、16拍...）
+        const blockOffsetBeats = index * BEATS_PER_BLOCK;
+        // カノンによるトラックごとの遅延
+        const canonDelayBeats = isCanon && track.id < 3 ? track.id * BEATS_PER_BLOCK : 0;
+
+        playbackTracks.push({
+          id: track.id,
+          blob: block.blob,
+          delayBeats: blockOffsetBeats + canonDelayBeats,
+          isLoop: track.id === 3 && index === 0, // ベースの1ブロック目だけループ
+        });
+      });
+    });
+
+    if (playbackTracks.length === 0) return;
+
+    setIsPlaying(true);
+    try {
+      // 2. Managerに発注書を渡して、終わるまで待つ！
+      const completed = await playback.play(playbackTracks, bpm);
+
+      if (completed) {
+        setIsPlaying(false); // 自然に最後まで鳴り終わった
+      }
+    } catch (error) {
+      console.error("再生エラー:", error);
+      setIsPlaying(false);
     }
   };
 
-  const playAll = async (isCanon: boolean = false) => {
-    if (!audioContextRef.current) audioContextRef.current = new AudioContext();
-    const ctx = audioContextRef.current;
-    const startTime = ctx.currentTime + 0.1;
-
-    tracks.forEach((track) => {
-      track.blocks.forEach(async (block, blockIndex) => {
-        if (!block.blob) return;
-
-        const arrayBuffer = await block.blob.arrayBuffer();
-        const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
-        const source = ctx.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(ctx.destination);
-
-        const canonDelay = isCanon && track.id < 3 ? track.id * secondsPerBlock : 0;
-        const blockOffset = blockIndex * secondsPerBlock;
-
-        if (track.id === 3 && blockIndex === 0) {
-          source.loop = true;
-          source.start(startTime);
-        } else {
-          source.start(startTime + canonDelay + blockOffset);
-        }
-      });
-    });
-  };
-
+  // ==========================================
+  // 以下、UIの描画（JSX）はロジックが消えて驚くほどクリーンに！
+  // ==========================================
   return (
     <div style={{ padding: "2rem", fontFamily: "sans-serif", maxWidth: "800px", margin: "0 auto" }}>
       <h2>Canon Recorder</h2>
 
-      {/* ★ BPMコントロールUI */}
       <div
         style={{
           marginBottom: "20px",
@@ -200,15 +225,15 @@ function App() {
                     <span style={{ fontSize: "12px", color: "#f39c12", fontWeight: "bold" }}>Wait...</span>
                   ) : isTarget ? (
                     <button
-                      onClick={stopRecording}
+                      onClick={handleStopRecording}
                       style={{ background: "transparent", border: "none", cursor: "pointer", fontSize: "20px" }}
                     >
                       ⏹
                     </button>
                   ) : (
                     <button
-                      onClick={() => startRecording(track.id, index)}
-                      disabled={recordingTarget !== null}
+                      onClick={() => handleStartRecording(track.id, index)}
+                      disabled={recordingTarget !== null || isPlaying}
                       style={{ background: "transparent", border: "none", cursor: "pointer", fontSize: "18px" }}
                     >
                       {hasData ? "🔄" : "⏺"}
@@ -223,13 +248,15 @@ function App() {
 
       <div style={{ marginTop: "30px", display: "flex", gap: "10px" }}>
         <button
-          onClick={() => playAll(false)}
+          onClick={() => handlePlayAll(false)}
+          disabled={recordingTarget !== null}
           style={{ flex: 1, padding: "12px", borderRadius: "8px", cursor: "pointer" }}
         >
-          一斉再生
+          {isPlaying ? "⏹ 停止" : "一斉再生"}
         </button>
         <button
-          onClick={() => playAll(true)}
+          onClick={() => handlePlayAll(true)}
+          disabled={recordingTarget !== null}
           style={{
             flex: 1,
             padding: "12px",
@@ -240,7 +267,7 @@ function App() {
             cursor: "pointer",
           }}
         >
-          カノン再生
+          {isPlaying ? "⏹ 停止" : "カノン再生"}
         </button>
       </div>
 
